@@ -10,15 +10,6 @@ from uuid import uuid4
 
 app = FastAPI(title="Orders API")
 
-# Allow browser-based graders to access the API.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 TOTAL_ORDERS = 52
 RATE_LIMIT = 19
 WINDOW_SECONDS = 10
@@ -27,7 +18,7 @@ lock = Lock()
 idempotency_store = {}
 rate_buckets = {}
 
-# Fixed catalog: IDs 1 through 52.
+# Fixed catalog with IDs from 1 through 52.
 catalog = [
     {"id": i, "product": f"Product {i}", "quantity": 1}
     for i in range(1, TOTAL_ORDERS + 1)
@@ -39,10 +30,10 @@ class OrderInput(BaseModel):
     quantity: int = 1
 
 
+# Rate-limiting middleware.
+# OPTIONS requests must not consume the client's rate limit.
 @app.middleware("http")
 async def apply_rate_limit(request: Request, call_next):
-    # Count API requests by X-Client-Id, independently.
-    # Exclude preflight requests and health checks.
     if request.method == "OPTIONS" or request.url.path == "/health":
         return await call_next(request)
 
@@ -51,14 +42,20 @@ async def apply_rate_limit(request: Request, call_next):
 
     with lock:
         timestamps = rate_buckets.setdefault(client_id, [])
+
+        # Keep only requests from the last 10 seconds.
         timestamps[:] = [
-            t for t in timestamps if now - t < WINDOW_SECONDS
+            timestamp
+            for timestamp in timestamps
+            if now - timestamp < WINDOW_SECONDS
         ]
 
         if len(timestamps) >= RATE_LIMIT:
             retry_after = max(
-                1, ceil(WINDOW_SECONDS - (now - timestamps[0]))
+                1,
+                ceil(WINDOW_SECONDS - (now - timestamps[0]))
             )
+
             return JSONResponse(
                 status_code=429,
                 content={"detail": "Rate limit exceeded"},
@@ -68,6 +65,18 @@ async def apply_rate_limit(request: Request, call_next):
         timestamps.append(now)
 
     return await call_next(request)
+
+
+# Register CORS AFTER the rate-limit middleware.
+# Starlette places the last registered middleware on the outside,
+# allowing CORS headers to be added to rate-limit error responses too.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/")
@@ -91,7 +100,7 @@ def create_order(
     idempotency_key: str = Header(..., alias="Idempotency-Key"),
 ):
     with lock:
-        # Reuse the exact same order for a repeated key.
+        # Return the original order when the key has already been used.
         if idempotency_key in idempotency_store:
             return idempotency_store[idempotency_key]
 
@@ -100,27 +109,33 @@ def create_order(
             "product": data.product,
             "quantity": data.quantity,
         }
+
         idempotency_store[idempotency_key] = order
         return order
 
 
 @app.get("/orders")
 def get_orders(
-    limit: int = Query(10, ge=1, le=52),
+    limit: int = Query(default=10, ge=1, le=52),
     cursor: str | None = None,
 ):
-    # The cursor represents the last catalog ID returned.
-    # An empty cursor starts at ID 1.
+    # Cursor represents the last ID returned.
     if cursor is None or cursor == "":
         start_id = 1
     else:
         try:
             start_id = int(cursor) + 1
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="Invalid cursor")
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid cursor",
+            )
 
     if start_id < 1 or start_id > TOTAL_ORDERS + 1:
-        raise HTTPException(status_code=400, detail="Invalid cursor")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid cursor",
+        )
 
     items = [
         item for item in catalog
