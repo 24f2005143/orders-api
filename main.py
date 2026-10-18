@@ -70,12 +70,14 @@ async def apply_rate_limit(request: Request, call_next):
 # Register CORS AFTER the rate-limit middleware.
 # Starlette places the last registered middleware on the outside,
 # allowing CORS headers to be added to rate-limit error responses too.
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Retry-After"],
 )
 
 
